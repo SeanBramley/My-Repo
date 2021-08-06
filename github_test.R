@@ -8,3 +8,9 @@ install.packages('repro')
 usethis::create_github_token()
 
 gitcreds::gitcreds_set()
+
+gitcreds::gitcreds_get(use_cache = FALSE)
+
+gh::gh_whoami()
+
+usethis::git_sitrep()
