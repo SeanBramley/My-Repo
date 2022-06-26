@@ -1,0 +1,268 @@
+---
+title: "Clinic Data Analysis"
+author: "Sean Bramley"
+date: "7/22/2021"
+output:
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(Amelia)
+library(lubridate)
+library(survival)
+library(survminer)
+library(ggplot2)
+library(knitr)
+library(ggpubr)
+library(sqldf)
+opts_chunk$set(fig.width = 5, 
+               fig.height = 4
+)
+opts_knit$set(warning = FALSE,
+              message = FALSE)
+
+```
+
+```{r read in data files, include=FALSE}
+patients <- read_csv("patient.csv")
+performance_status <- read_csv("performance_status.csv")
+kps_to_ecog <- read_csv("kps_to_ecog_conversion.csv")
+
+sqldf(SELECT smokers, age_at_diagnosis, )
+```
+
+# Data Analysis
+
+### Data Cleaning
+
+The first step of my analysis was to inspect the data set for errors or anomalies. I first noticed that the date variables in the "patients" data set were not correctly formatted so I converted them to the proper format. After converting dates to the correct format, I checked for errors in the dates themselves. I subtracted all final observation dates from diagnosis dates and found two records where the final observation was recorded before the date of diagnosis so I dropped those records. I also found a handful of final observation dates that were recorded in the years 2026, 2027, and 2028. Since this is impossible, I made the assumption that these were data entry errors and that the years should actually be 2016, 2017, and 2018 so I subtracted 10 years from those records. 
+
+Next, I checked for missing data. I found that there were 97 patients missing data on their smoking status and 106 missing data on treatment. I dropped those records for the sake of simplicity in this analysis but in a real-life scenario it would make sense to think about imputation. 
+```{r data inspection and question 1, include=FALSE}
+summary(patients) #date variables are not formatted correctly
+
+#converting date variables to date format
+patients$date_of_diagnosis <- mdy(patients$date_of_diagnosis)
+patients$date_of_final_obs <- mdy(patients$date_of_final_obs)
+
+#checking to see if any patients have final observation before date of diagnosis
+patients$date_diff <- patients$date_of_final_obs - patients$date_of_diagnosis
+
+missmap(patients) #missing data on treatment and smoking status
+table(patients$smoking_status) #missing 97
+table(patients$treatment) #missing 106
+
+patients <- patients %>%
+  filter(date_diff >= 0) %>%
+  mutate(date_of_final_obs = case_when(
+           year(date_of_final_obs) > 2019 ~  date_of_final_obs - years(10),
+           TRUE ~ date_of_final_obs)) %>%
+  drop_na()
+  
+```
+
+### Gender and Race
+
+Gender is relatively evenly distributed across ethnic groups in this data set. Overall, there are more men and this pattern holds across ethnic groups. Among White, Black, and American Native patients, 53% of patients are male and 47% are female. Among Asian and Pacific Islander patients, the distribution of men and women is even. The distribution can be seen in the following chart:
+
+```{r question 2, echo = FALSE}
+ggplot(data = patients,
+           mapping = aes(x = sex, fill = race)) +
+geom_bar() + labs(title = "Gender Distribution by Race")
+```
+
+Despite some small differences between genders, race and gender are not associated on a statistically significant level based on a Chi-Squared test (p-value = 0.8809). 
+
+```{r question 2 contd, include = FALSE}
+table(patients$sex, patients$race)
+chisq.test(patients$sex, patients$race)
+```
+
+### Age Distribution and Treatment
+
+The next step of my analysis examined age and treatment among patients. The average and median age of diagnosis of patients under active surveillance and not in treatment is older than patients who are in treatment. The relationship can be seen in the following boxplot:  
+```{r question 3, include = FALSE}
+q_3 <- patients %>%
+  mutate(treatment = 
+           fct_collapse(treatment,
+               "Treatment" = c("Targeted Therapy", "Chemotherapy"),
+               "Active Surveillance" = c("Active Surveillance (No Treatment)"))) %>%
+  drop_na()
+```
+
+```{r question 3 plot, echo = FALSE}
+ggboxplot(q_3, x = "treatment", y = "age_at_diagnosis",
+          fill = "treatment",
+          palette = c("#ff0000", "#27AE60"),
+          title = "Age Distribution by Treatment Status",
+          xlab = "Treatment Status", ylab = "Age at Diagnosis",
+          font.label = list(size = 24, color = "black"),
+          legend = "none")
+```
+
+Statistical testing confirmed that the difference observed in age at diagnosis and treatment status is statistically significant using a T-test (p-value < 2.2e-16). However, there was missing data on treatment that was dropped so these results may not be fully accurate. 
+```{r question 3 contd, include = FALSE}
+tapply(q_3$age_at_diagnosis, q_3$treatment, summary)
+t.test(age_at_diagnosis ~ treatment, alternative = c("two.sided"), data = q_3)
+```
+
+
+### Smoking and Age at Diagnosis
+
+At this clinic, there is a statistically significant difference in average age at diagnosis between smokers and non-smokers; however, the difference is relatively small (< 1 year) and would not be considered clinically relevant or meaningful. 
+```{r question 4, echo = FALSE}
+ggboxplot(patients, x = "smoking_status", y = "age_at_diagnosis",
+          fill = "smoking_status",
+          palette = c("#ffff00", "#91278d"),
+          title = "Age Distribution by Smoking Status",
+          xlab = "Smoking Status", ylab = "Age at Diagnosis",
+          font.label = list(size = 24, color = "black"),
+          legend = "none")
+```
+
+```{r question 4 contd, include = FALSE}
+tapply(patients$age_at_diagnosis, patients$smoking_status, summary)
+t.test(age_at_diagnosis ~ smoking_status, alternative = c("two.sided"), data = patients)
+```
+
+
+### Performance Score at Baseline
+
+To derive the performance score at baseline for each patient, I first merged the patients and performance status data sets by their common field, patient ID. Then, I converted all of the performance scores to the ECOG metric. For the sake of tidiness, I kept only columns that seemed relevant to the question in the data set. Next, I grouped the data set by patient IDs and then filtered the data set to only keep the earliest date for which a performance score was assessed. 
+
+```{r question 5, include = FALSE}
+patient_performance <- merge(patients, performance_status, by = "patient_id") %>%
+    mutate(score = case_when(
+    method == "kps" & score == 100 ~ 0,
+    method == "kps" & score == 90 | score == 80 | score == 70 ~ 1,
+    method == "kps" & score == 60 | score == 50 ~ 2,
+    method == "kps" & score == 40 | score == 30 ~ 3,
+    method == "kps" & score == 20 | score == 10 ~ 4,
+    method == "kps" & score == 0 ~ 5,
+    TRUE ~ score)) 
+
+q_5 <- patient_performance %>%
+  select(patient_id, score, date_assessed) %>%
+  group_by(patient_id) %>%
+  filter(date_assessed == min(date_assessed))
+
+head(q_5)
+```
+
+### Associations with Chemotherapy and Targeted Therapy
+
+To test associations with the two different therapies, I used logistic regression so that I could adjust any observed associations for covariates. I found that race, sex, age, and smoking status all had associations with whether or not a patient was prescribed chemotherapy or targeted therapy. After adjusting each of the variables for the others, all remained statistically significant except for smoking status. Odds ratios in the following table can be interpreted as odds of receiving targeted therapy vs. chemotherapy. 
+```{r question 6, include = FALSE}
+q_6 <- patient_performance %>%
+  filter(treatment != "Active Surveillance (No Treatment)") %>%
+  mutate(treatment = factor(treatment, levels = c("Chemotherapy", "Targeted Therapy")),
+         race = factor(race, levels = c("White", "Black or African American", "Asian", 
+                                        "Native Hawaiian or Other Pacific Islander", 
+                                        "American Indian or Alaska Native", "Other Race", "Patient Declined")),
+         score = factor(score, levels = c("5", "4", "3", "2", "1", "0"))) 
+
+race_logistic <- glm(treatment ~ race, family = binomial, data = q_6)
+summary(race_logistic)
+sex_logistic <- glm(treatment ~ sex, family = binomial, data = q_6)
+summary(sex_logistic)
+age_logistic <- glm(treatment ~ age_at_diagnosis, family = binomial, data = q_6)
+summary(age_logistic)
+smoking_logistic <- glm(treatment ~ smoking_status, family = binomial, data = q_6)
+summary(smoking_logistic)
+performance_logistic <- glm(treatment ~ score, family = binomial, data = q_6)
+summary(performance_logistic)
+
+adjusted_logistic <- glm(treatment ~ race + sex + age_at_diagnosis + smoking_status, family = binomial, 
+                         data = q_6)
+summary(adjusted_logistic)
+```
+
+```{r question 6 table, echo=FALSE}
+broom::tidy(glm(treatment ~ race + sex + age_at_diagnosis + smoking_status, family = binomial, 
+                         data = q_6), exp = TRUE) %>%
+  kable()
+```
+
+
+# Survival Analysis
+
+### Median Survival Time
+
+The median survival time for patients at this clinic is 214 days and the 1 year survival probability is 39.2%. The survival curve can be seen in the following Kaplan-Meier plot: 
+```{r question 7, include = FALSE}
+q_7 <- patients %>%
+  mutate(time = as.numeric(difftime(date_of_final_obs, date_of_diagnosis, units = "days")),
+         status = case_when(
+           final_obs_status == "alive" ~ 1,
+           final_obs_status == "expired" ~ 2))
+
+#median survival time, 214 days
+survfit(Surv(time, status) ~ 1, data = q_7)
+```
+
+```{r km plot, echo = FALSE}
+#km plot
+ggsurvplot(
+    fit = survfit(Surv(time, status) ~ 1, data = q_7), 
+    xlab = "Days", 
+    ylab = "Overall survival probability")
+```
+
+```{r question 8, include = FALSE}
+#1 year survival probability
+summary(survfit(Surv(time, status) ~ 1, data = q_7), times = 365.25)
+```
+
+### Survival Differences in Chemotherapy and Targeted Therapy
+
+Next, I tested the survival outcomes of patients receiving chemotherapy vs. patients receiving targeted therapy. The survival curve for the two therapies can be seen in the following Kaplan-Meier plot: 
+```{r question 9, include = FALSE}
+q_9 <- q_7 %>%
+  filter(treatment != "Active Surveillance (No Treatment)")
+
+survdiff(Surv(time, status) ~ treatment, data = q_9)
+```
+```{r question 9 plot, echo = FALSE}
+ggsurvplot(
+    fit = survfit(Surv(time, status) ~ treatment, data = q_9),
+    xlab = "Days", 
+    ylab = "Overall survival probability")
+```
+
+The difference in survival between the two therapies was statistically significant. Due to missing data that was dropped regarding treatments, this analysis may not be entirely accurate. 
+
+### Cox Proportional Hazards Regression Model
+
+The final step of this survival analysis was to use Cox proportional hazards regression to test and adjust for associations with survival in this data set. First, I checked the treatment, gender, race, age, and smoking status variables individually in the Cox models. I found that they were all individually associated with survival except for race so I included all the significant variables in a single model together to find out how they interacted when adjusting for one another. Treatment, gender, age, and smoking status all remained significant after adjusting for one another. The effect estimates of the variables do not indicate that any of them improve survival; they all appear to increase the risk of death or dropping out of observation. 
+```{r question 10, include = FALSE}
+
+treatment_ph <- coxph(Surv(time, status) ~ treatment, data = q_9)
+summary(treatment_ph)
+#chemotherapy offers better survival than targeted treatment
+sex_ph <- coxph(Surv(time, status) ~ sex, data = q_9)
+summary(sex_ph)
+#men have worse overall survival than women
+race_ph <- coxph(Surv(time, status) ~ race, data = q_9)
+summary(race_ph)
+#race is not associated with overall survival
+age_ph <- coxph(Surv(time, status) ~ age_at_diagnosis, data = q_9)
+summary(age_ph)
+#age is associated with overall survival, as age increases so does the hazard of death or dropping out of observation.
+smoking_ph <- coxph(Surv(time, status) ~ smoking_status, data = q_9)
+summary(smoking_ph)
+#smoking is strongly associated with survival, smokers have 5.7 times the hazard of death compared to those who do not smoke. 
+
+adjusted_ph <- coxph(Surv(time, status) ~ smoking_status + treatment + sex + age_at_diagnosis, data = q_9)
+summary(adjusted_ph)
+```
+
+
+```{r ph reg table, echo = FALSE}
+broom::tidy(coxph(Surv(time, status) ~ smoking_status + treatment + sex + age_at_diagnosis, data = q_9), exp = TRUE) %>%
+  kable()
+
+```
+
+
+

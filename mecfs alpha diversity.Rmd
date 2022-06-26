@@ -1,0 +1,449 @@
+---
+title: "ME/CFS and the Oral Microbiome"
+author: "Sean Bramley"
+date: "2/15/2021"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, include=FALSE}
+library(knitr)
+library(plyr)
+library(tidyverse)
+library(gdata)
+library(gridExtra)
+library(ggplot2)
+library(lme4) 
+library(lmerTest)
+library(mgcv) 
+library(metamicrobiomeR)
+library(Hmisc)
+library(Gmisc)
+library(sqldf)
+library(caret)
+#install.packages("arsenal")
+library(arsenal)
+
+#install.packages("gamlss")
+
+library(gamlss)
+```
+
+##Read in Data
+```{r read in}
+metadata <- read_csv("C:/Users/seanl/Desktop/Spring 2021/Thesis/Analysis/Data/RSA_metadataOA_2021_1_20.186_cheng.csv") %>%
+  janitor::clean_names() %>%
+  mutate(sample_type = factor(sample_type, c("Control", "Case")),
+         sex = factor(sex, c("F", "M")),
+         bmi_cat = factor(bmi_cat, c("Underweight", "Normal", "Overweight", "Obese")),
+         ibs_dx = factor(ibs_dx, c("Y", "N")),
+         allergy_dx = factor(allergy_dx, c("Y", "N")),
+         anti_depressant_rx = factor(anti_depressant_rx, c("Y", "N")),
+         pain_narc_rx = factor(pain_narc_rx, c("Y", "N")),
+         antimicro_rx = factor(antimicro_rx, c("Y", "N")),
+         antibiotic_use = factor(antibiotic_use, c("Y", "N")),
+         probiotic_supp_use = factor(probiotic_supp_use, c("Y", "N")),
+         prebiotic_supp_use = factor(prebiotic_supp_use, c("Y", "N")),
+         site = factor(site, c("california", "florida", "nevada", "utah", "new_york")),
+         category = factor(category, c("MECFS_IBS", "MECFS_woIBS", "Control", "Control_IBS")),
+         race_hispanic = factor(race_hispanic, c("White_Non_Hispanic", "Hispanic", "Non_White_Non_Hispanic"))
+         )
+
+alpha_shannon <- read_csv("C:/Users/seanl/Desktop/Spring 2021/Thesis/Analysis/Data/shannon.csv") %>%
+  janitor::clean_names() %>%
+  dplyr::select(saliva_id, shannon)
+alpha_chao1 <- read_csv("C:/Users/seanl/Desktop/Spring 2021/Thesis/Analysis/Data/chao1.csv") %>%
+  janitor::clean_names() %>%
+  dplyr::select(saliva_id, chao1)
+alpha_evenness <- read_csv("C:/Users/seanl/Desktop/Spring 2021/Thesis/Analysis/Data/evenness.csv") %>%
+  janitor::clean_names() %>%
+  dplyr::select(saliva_id, evenness)
+alpha_otus <- read_csv("C:/Users/seanl/Desktop/Spring 2021/Thesis/Analysis/Data/observed_otu.csv") %>%
+  janitor::clean_names() %>%
+  dplyr::select(saliva_id, observed_otus)
+```
+
+##Joining Alpha Diversity Data sets to the Metadata file
+```{r sql}
+alpha_merge <- sqldf("SELECT a.shannon, b.chao1, c.evenness, d.observed_otus, m.*
+                     FROM metadata AS m
+                     INNER JOIN alpha_shannon AS a
+                     ON m.saliva_id = a.saliva_id
+                     INNER JOIN alpha_chao1 AS b
+                     ON m.saliva_id = b.saliva_id
+                     INNER JOIN alpha_evenness AS c
+                     ON m.saliva_id = c.saliva_id
+                     INNER JOIN alpha_otus AS d
+                     ON m.saliva_id = d.saliva_id;", method="raw")
+
+alpha_merge$race_hispanic <- factor(alpha_merge$race_hispanic, c("White_Non_Hispanic", "Hispanic", "Non_White_Non_Hispanic"))
+alpha_merge$sex <- factor(alpha_merge$sex, c("M", "F"))
+
+
+write.csv(alpha_merge, "C:/Users/seanl/Desktop/Spring 2021/Thesis/Analysis/Data/alpha.merge.csv")
+#Checking distribution of alpha diversity
+hist(alpha_merge$shannon)
+hist(alpha_merge$chao1)
+hist(alpha_merge$evenness)
+hist(alpha_merge$observed_otus)
+#all approximately normal 
+```
+
+
+#Comparing model fits 
+```{r alpha lm}
+alpha_models <- alpha_merge %>%
+    mutate(bmi = scale(bmi),
+         age_at_a1 = scale(age_at_a1)) %>%
+  mutate(bmi = as.double(bmi),
+         age_at_a1 = as.double(age_at_a1))
+
+lm_shannon <- lm(shannon ~ mecfs_status + site + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use +
+                   probiotic_supp_use + prebiotic_supp_use + ibs_dx, data = alpha_models)
+lm_chao1 <- lm(chao1 ~ mecfs_status + site + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use +
+                   probiotic_supp_use + prebiotic_supp_use + ibs_dx, data = alpha_models)
+lm_evenness <- lm(evenness ~ mecfs_status + site + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use +
+                   probiotic_supp_use + prebiotic_supp_use + ibs_dx, data = alpha_models)
+
+lm_ibs <- lm(shannon ~ ibs_dx, data = alpha_models)
+lm_mecfs <- lm(shannon ~ mecfs_status, data = alpha_models)
+lm_mecfsibs <- lm(shannon ~ mecfs_status + ibs_dx, data = alpha_models)
+summary(lm_mecfsibs)
+summary(lm_mecfs)
+summary(lm_ibs)
+summary(lm_shannon)
+summary(alpha_models$shannon)
+table(alpha_models$ibs_dx)
+table(alpha_models$mecfs_status)
+BIC(lm_shannon) #500.3964
+BIC(lm_chao1) #2208.77
+BIC(lm_evenness) #-262.9123
+
+hist(alpha_models$shannon)
+```
+
+```{r negative binomial for count}
+otu_nb <- glm.nb(observed_otus ~ mecfs_status + site + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use + probiotic_supp_use + prebiotic_supp_use + ibs_dx, maxit = 100, data = alpha_models)
+summary(otu_nb)
+BIC(otu_nb) #2201.204
+```
+
+Compared linear models with GAMLSS and GLM with gamma dist. Linear models fit best for shannon, chao1, and evenness. OTU's modeled with glm poisson-link and negative binomial. NB fit best for OTU. 
+
+#Checking for confounding in linear models
+```{r confounding}
+painrx_shannon <- lm(shannon ~ mecfs_status + site + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use +
+                   probiotic_supp_use + prebiotic_supp_use + ibs_dx + pain_narc_rx, data = alpha_models)
+painrx_chao1 <- lm(chao1 ~ mecfs_status + site + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use +
+                   probiotic_supp_use + prebiotic_supp_use + ibs_dx + pain_narc_rx, data = alpha_models)
+painrx_evenness <- lm(evenness ~ mecfs_status + site + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use +
+                   probiotic_supp_use + prebiotic_supp_use + ibs_dx + pain_narc_rx, data = alpha_models)
+
+summary(lm_shannon) #MECFS: -0.205
+summary(lm_chao1) #MECFS: -4.630
+summary(lm_evenness) #MECFS: -0.018
+
+summary(painrx_shannon) #MECFS: -0.118
+summary(painrx_chao1) #MECFS: -3.931
+summary(painrx_evenness) #MECFS: -0.008
+
+(-0.205--0.118)/-0.118 #73.72% change
+(-4.630--3.931)/-3.931 #17.78% change
+(-0.018--0.008)/-0.008 #125% change 
+```
+
+```{r antidepressant}
+depressrx_shannon <- lm(shannon ~ mecfs_status + site + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use +
+                   probiotic_supp_use + prebiotic_supp_use + ibs_dx + anti_depressant_rx, data = alpha_models)
+depressrx_chao1 <- lm(chao1 ~ mecfs_status + site + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use +
+                   probiotic_supp_use + prebiotic_supp_use + ibs_dx + anti_depressant_rx, data = alpha_models)
+depressrx_evenness <- lm(evenness ~ mecfs_status + site + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use +
+                   probiotic_supp_use + prebiotic_supp_use + ibs_dx + anti_depressant_rx, data = alpha_models)
+
+summary(lm_shannon) #MECFS: -0.205
+summary(lm_chao1) #MECFS: -4.630
+summary(lm_evenness) #MECFS: -0.018
+
+summary(depressrx_shannon) #MECFS: -0.228
+summary(depressrx_chao1) #MECFS: -3.171
+summary(depressrx_evenness) #MECFS: -0.020
+
+(-0.205--0.228)/-0.228 #10.09% change
+(-4.630--3.171)/-3.171 #46.07% change
+(-0.018--0.020)/-0.020 #10% change 
+```
+
+Anti-depressant/pain narcotics appear to be confounders so I ran adjusted models
+```{r adjusted models}
+adjusted_shannon <- lm(shannon ~ mecfs_status + site + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use +
+                   probiotic_supp_use + prebiotic_supp_use + ibs_dx + anti_depressant_rx + pain_narc_rx, data = alpha_models)
+adjusted_chao1 <- lm(chao1 ~ mecfs_status + site + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use +
+                   probiotic_supp_use + prebiotic_supp_use + ibs_dx + anti_depressant_rx + pain_narc_rx, data = alpha_models)
+adjusted_evenness <- lm(evenness ~ mecfs_status + site + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use +
+                   probiotic_supp_use + prebiotic_supp_use + ibs_dx + anti_depressant_rx  + pain_narc_rx, data = alpha_models)
+adjusted_otu <- glm.nb(observed_otus ~ mecfs_status + site + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use + probiotic_supp_use + prebiotic_supp_use + ibs_dx + anti_depressant_rx + pain_narc_rx, maxit = 100, data = alpha_models)
+
+summary(lm_shannon) #MECFS: -0.205
+summary(lm_chao1) #MECFS: -4.630
+summary(lm_evenness) #MECFS: -0.018
+summary(otu_nb) #MECFS: -0.019
+
+summary(adjusted_shannon) #MECFS: -0.143
+summary(adjusted_chao1) #MECFS: -2.422
+summary(adjusted_evenness) #MECFS: -0.0103
+summary(adjusted_otu) #MECFS: -0.014
+
+(-0.205--0.143)/-0.143 #43.36% change
+(-4.630--2.422)/-2.422 #91.16% change
+(-0.018--0.0103)/-0.0103 #75% change 
+(-0.019--0.014)/-0.014 #35.71% change
+```
+
+Alpha diversity by state
+```{r state linear models}
+ny_shannon <- alpha_models %>%
+  filter(site == "new_york")
+
+lm_ny_shannon <- lm(shannon ~ mecfs_status + ibs_dx + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use +
+                   probiotic_supp_use + prebiotic_supp_use + anti_depressant_rx + pain_narc_rx, data = ny_shannon)
+lm_ny_chao1 <- lm(chao1 ~ mecfs_status + ibs_dx + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use +
+                   probiotic_supp_use + prebiotic_supp_use + anti_depressant_rx + pain_narc_rx, data = ny_shannon)
+lm_ny_evenness <- lm(evenness ~ mecfs_status + ibs_dx + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use +
+                   probiotic_supp_use + prebiotic_supp_use + anti_depressant_rx + pain_narc_rx, data = ny_shannon)
+lm_ny_otu <- glm.nb(observed_otus ~ mecfs_status + ibs_dx + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use + probiotic_supp_use + prebiotic_supp_use + anti_depressant_rx + pain_narc_rx, maxit = 100, data = ny_shannon)
+
+summary(lm_ny_shannon)
+summary(lm_ny_chao1)
+summary(lm_ny_evenness)
+summary(lm_ny_otu)
+
+nv_alpha <- alpha_models %>%
+  filter(site == "nevada")
+
+lm_nv_shannon <- lm(shannon ~ mecfs_status + ibs_dx + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use +
+                   probiotic_supp_use + prebiotic_supp_use + anti_depressant_rx + pain_narc_rx, data = nv_alpha)
+lm_nv_chao1 <- lm(chao1 ~ mecfs_status + ibs_dx + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use +
+                   probiotic_supp_use + prebiotic_supp_use + anti_depressant_rx + pain_narc_rx, data = nv_alpha)
+lm_nv_evenness <- lm(evenness ~ mecfs_status + ibs_dx + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use +
+                   probiotic_supp_use + prebiotic_supp_use + anti_depressant_rx + pain_narc_rx, data = nv_alpha)
+lm_nv_otu <- glm.nb(observed_otus ~ mecfs_status + ibs_dx + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use + probiotic_supp_use + prebiotic_supp_use + anti_depressant_rx + pain_narc_rx, maxit = 100, data = nv_alpha)
+
+summary(lm_nv_shannon)
+summary(lm_nv_chao1)
+summary(lm_nv_evenness)
+summary(lm_nv_otu)
+
+ca_alpha <- alpha_models %>%
+  filter(site == "california")
+table(ca_alpha$pain_narc_rx)
+
+lm_ca_shannon <- lm(shannon ~ mecfs_status + ibs_dx + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use +
+                   probiotic_supp_use + prebiotic_supp_use + anti_depressant_rx, data = ca_alpha)
+lm_ca_chao1 <- lm(chao1 ~ mecfs_status + ibs_dx + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use +
+                   probiotic_supp_use + prebiotic_supp_use + anti_depressant_rx, data = ca_alpha)
+lm_ca_evenness <- lm(evenness ~ mecfs_status + ibs_dx + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use +
+                   probiotic_supp_use + prebiotic_supp_use + anti_depressant_rx, data = ca_alpha)
+lm_ca_otu <- glm.nb(observed_otus ~ mecfs_status + ibs_dx + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use + probiotic_supp_use + prebiotic_supp_use + anti_depressant_rx, maxit = 100, data = ca_alpha)
+
+summary(lm_ca_shannon)
+summary(lm_ca_chao1)
+summary(lm_ca_evenness)
+summary(lm_ca_otu)
+
+ut_alpha <- alpha_models %>%
+  filter(site == "utah")
+table(ut_alpha$prebiotic_supp_use)
+
+lm_ut_shannon <- lm(shannon ~ mecfs_status + ibs_dx + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use +
+                   probiotic_supp_use + anti_depressant_rx + pain_narc_rx, data = ut_alpha)
+lm_ut_chao1 <- lm(chao1 ~ mecfs_status + ibs_dx + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use +
+                   probiotic_supp_use + anti_depressant_rx + pain_narc_rx, data = ut_alpha)
+lm_ut_evenness <- lm(evenness ~ mecfs_status + ibs_dx + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use +
+                   probiotic_supp_use + anti_depressant_rx + pain_narc_rx, data = ut_alpha)
+lm_ut_otu <- glm.nb(observed_otus ~ mecfs_status + ibs_dx + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use + probiotic_supp_use + anti_depressant_rx + pain_narc_rx, maxit = 100, data = ut_alpha)
+
+summary(lm_ut_shannon)
+summary(lm_ut_chao1)
+summary(lm_ut_evenness)
+summary(lm_ut_otu)
+
+```
+
+Alpha diversity in PAM clusters
+```{r cluster alpha diversity}
+
+new_metadata <- readr::read_tsv("C:/Users/seanl/Desktop/Spring 2021/Thesis/Analysis/Data/RSA_metadataOA_2021_3_23.186.txt", col_names=TRUE) %>%
+  janitor::clean_names() %>%
+  mutate(sample_type = factor(sample_type, c("Control", "Case")),
+         sex = factor(sex, c("F", "M")),
+         bmi_cat = factor(bmi_cat, c("Underweight", "Normal", "Overweight", "Obese")),
+         ibs_dx = factor(ibs_dx, c("Y", "N")),
+         allergy_dx = factor(allergy_dx, c("Y", "N")),
+         anti_depressant_rx = factor(anti_depressant_rx, c("Y", "N")),
+         pain_narc_rx = factor(pain_narc_rx, c("Y", "N")),
+         antimicro_rx = factor(antimicro_rx, c("Y", "N")),
+         antibiotic_use = factor(antibiotic_use, c("Y", "N")),
+         probiotic_supp_use = factor(probiotic_supp_use, c("Y", "N")),
+         prebiotic_supp_use = factor(prebiotic_supp_use, c("Y", "N")),
+         race_hispanic = factor(race_hispanic, c("White_Non_Hispanic", "Hispanic", "Non_White_Non_Hispanic")),
+         site = factor(site, c("california", "florida", "nevada", "utah", "new_york")),
+         category = factor(category, c("MECFS_IBS", "MECFS_woIBS", "Control", "Control_IBS")),
+         pam2 = factor(pam2, c("1", "2"))
+  )
+
+alpha_cluster_merge <- sqldf("SELECT a.shannon, b.chao1, c.evenness, d.observed_otus, m.*
+                     FROM new_metadata AS m
+                     INNER JOIN alpha_shannon AS a
+                     ON m.saliva_id = a.saliva_id
+                     INNER JOIN alpha_chao1 AS b
+                     ON m.saliva_id = b.saliva_id
+                     INNER JOIN alpha_evenness AS c
+                     ON m.saliva_id = c.saliva_id
+                     INNER JOIN alpha_otus AS d
+                     ON m.saliva_id = d.saliva_id;", method="raw")
+
+alpha_cluster_merge$race_hispanic <- factor(alpha_cluster_merge$race_hispanic, c("White_Non_Hispanic", "Hispanic", "Non_White_Non_Hispanic"))
+alpha_cluster_merge$sex <- factor(alpha_cluster_merge$sex, c("M", "F"))
+
+c1_alpha <- alpha_cluster_merge %>%
+  filter(pam2 == "1")
+
+lm_c1_shannon <- lm(shannon ~ mecfs_status + ibs_dx + site + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use +
+                   probiotic_supp_use + prebiotic_supp_use + anti_depressant_rx + pain_narc_rx, data = c1_alpha)
+lm_c1_chao1 <- lm(chao1 ~ mecfs_status + ibs_dx + site + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use +
+                   probiotic_supp_use + prebiotic_supp_use + anti_depressant_rx + pain_narc_rx, data = c1_alpha)
+lm_c1_evenness <- lm(evenness ~ mecfs_status + ibs_dx + site + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use +
+                   probiotic_supp_use + prebiotic_supp_use + anti_depressant_rx + pain_narc_rx, data = c1_alpha)
+lm_c1_otu <- glm.nb(observed_otus ~ mecfs_status + ibs_dx + site + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use + probiotic_supp_use + prebiotic_supp_use + anti_depressant_rx + pain_narc_rx, maxit = 100, data = c1_alpha)
+
+summary(lm_c1_shannon)
+summary(lm_c1_chao1)
+summary(lm_c1_evenness)
+summary(lm_c1_otu)
+
+c2_alpha <- alpha_cluster_merge %>%
+  filter(pam2 == "2")
+
+lm_c2_shannon <- lm(shannon ~ mecfs_status + ibs_dx + site + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use +
+                   probiotic_supp_use + prebiotic_supp_use + anti_depressant_rx + pain_narc_rx, data = c2_alpha)
+lm_c2_chao1 <- lm(chao1 ~ mecfs_status + ibs_dx + site + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use +
+                   probiotic_supp_use + prebiotic_supp_use + anti_depressant_rx + pain_narc_rx, data = c2_alpha)
+lm_c2_evenness <- lm(evenness ~ mecfs_status + ibs_dx + site + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use +
+                   probiotic_supp_use + prebiotic_supp_use + anti_depressant_rx + pain_narc_rx, data = c2_alpha)
+lm_c2_otu <- glm.nb(observed_otus ~ mecfs_status + ibs_dx + site + sex + bmi + race_hispanic + age_at_a1 + antibiotic_use + probiotic_supp_use + prebiotic_supp_use  + anti_depressant_rx + pain_narc_rx, maxit = 100, data = c2_alpha)
+
+summary(lm_c2_shannon)
+summary(lm_c2_chao1)
+summary(lm_c2_evenness)
+summary(lm_c2_otu)
+
+```
+
+Output alpha diversity models as tables
+```{r final alpha models}
+library(sjPlot)
+
+tab_model(adjusted_shannon, adjusted_chao1, adjusted_evenness, adjusted_otu)
+tab_model(lm_shannon, lm_chao1, lm_evenness, otu_nb)
+
+tab_model(lm_ny_shannon, lm_ny_chao1, lm_ny_evenness, lm_ny_otu)
+tab_model(lm_nv_shannon, lm_nv_chao1, lm_nv_evenness, lm_nv_otu)
+tab_model(lm_ca_shannon, lm_ca_chao1, lm_ca_evenness, lm_ca_otu)
+tab_model(lm_ut_shannon, lm_ut_chao1, lm_ut_evenness, lm_ut_otu)
+
+tab_model(lm_c1_shannon, lm_c1_chao1, lm_c1_evenness, lm_c1_otu)
+tab_model(lm_c2_shannon, lm_c2_chao1, lm_c2_evenness, lm_c2_otu)
+```
+
+Logistic regression models for FDAARGOS 522
+```{r fdaargos522 logistic}
+daargos <- readxl::read_xlsx("C:/Users/seanl/Desktop/Spring 2021/Thesis/Streptococcus sp_FDAARGOS 522 and metadata.xlsx") %>%
+  janitor::clean_names() %>%
+  dplyr::select(taxonomy, streptococcus_sp_fdaargos_522) %>%
+  rename(sample_id = taxonomy,
+         taxa = streptococcus_sp_fdaargos_522)
+
+daargos_merge <- merge(daargos, new_metadata, by="sample_id") %>%
+  mutate(taxa_bin = case_when(
+    taxa > 0 ~ "1",
+    taxa == 0 ~ "0"
+  ))
+
+daargos_merge$bmi <- scale(daargos_merge$bmi)
+daargos_merge$age_at_a1 <- scale(daargos_merge$age_at_a1)
+
+daargos_merge$taxa_bin <- as.numeric(daargos_merge$taxa_bin)
+
+taxa_model <- glm(taxa_bin ~ mecfs_status + ibs_dx + site + sex + age_at_a1 + bmi + antibiotic_use + probiotic_supp_use + prebiotic_supp_use + race_hispanic + mecfs_status*ibs_dx, family = "binomial", data = daargos_merge)
+
+summary(taxa_model)
+
+table(daargos_merge$taxa_bin)
+
+daargos_cluster1 <- daargos_merge %>%
+  filter(pam2 == "1")
+
+daargos_cluster2 <- daargos_merge %>%
+  filter(pam2 == "2")
+
+taxa_model_clust1 <- glm(taxa_bin ~ mecfs_status + ibs_dx + site + sex + age_at_a1 + bmi + antibiotic_use + probiotic_supp_use + prebiotic_supp_use + race_hispanic, family = "binomial", data = daargos_cluster1)
+
+summary(taxa_model_clust1)
+
+taxa_model_clust2 <- glm(taxa_bin ~ mecfs_status + ibs_dx + site + sex + age_at_a1 + bmi + antibiotic_use + probiotic_supp_use + prebiotic_supp_use + race_hispanic, family = "binomial", data = daargos_cluster2)
+
+summary(taxa_model_clust2)
+
+tbl1 <- tableby(taxa_bin ~ mecfs_status + ibs_dx + site + pam2 + sex + age_at_a1 + bmi + antibiotic_use + probiotic_supp_use + prebiotic_supp_use + race_hispanic, data = daargos_merge)
+
+summary(tbl1)
+
+tbl1 <- as.data.frame(tbl1)
+tab_df(tbl1)
+tbl1
+
+```
+
+Demographics by FDAARGOS 522 presence
+```{r fdaargos table}
+daargos_merge$taxa_bin <- as.factor(daargos_merge$taxa_bin)
+
+label(daargos_merge$sample_type) <- "ME/CFS Status"
+label(daargos_merge$sex) <- "Sex"
+label(daargos_merge$bmi_cat) <- "BMI Category"
+label(daargos_merge$race_hispanic) <- "Race"
+label(daargos_merge$ibs_dx) <- "IBS Status"
+label(daargos_merge$pain_narc_rx) <- "Pain Narcotic Rx"
+label(daargos_merge$antibiotic_use) <- "Antibiotic Use"
+label(daargos_merge$probiotic_supp_use) <- "Probiotic Supplements"
+label(daargos_merge$prebiotic_supp_use) <- "Prebiotic Supplements"
+label(daargos_merge$site) <- "Site"
+label(daargos_merge$pam2) <- "Cluster"
+label(daargos_merge$taxa_bin) <- "Streptococcus FDAARGOS522 Presence"
+
+getTable1Stats <- function(x, digits = 0, ...){
+  getDescriptionStatsBy(x = x,
+                        by = daargos_merge$taxa_bin,
+                        digits = digits,
+                        header_count = TRUE,
+                        statistics = TRUE,
+                        ...)
+}
+
+mergeDesc(getTable1Stats(daargos_merge$sex),
+          getTable1Stats(daargos_merge$bmi_cat),
+          getTable1Stats(daargos_merge$race_hispanic),
+          getTable1Stats(daargos_merge$ibs_dx),
+          getTable1Stats(daargos_merge$site),
+          getTable1Stats(daargos_merge$pain_narc_rx),
+          getTable1Stats(daargos_merge$pam2),
+          getTable1Stats(daargos_merge$antibiotic_use),
+          getTable1Stats(daargos_merge$probiotic_supp_use),
+          getTable1Stats(daargos_merge$prebiotic_supp_use),
+          getTable1Stats(daargos_merge$sample_type),
+          htmlTable_args = list(caption = "FDAARGOS522 Presence"))
+
+```
